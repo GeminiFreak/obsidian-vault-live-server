@@ -935,6 +935,10 @@ ${customVarsCss}
       height: auto !important;
       overflow-x: hidden !important;
       overflow-y: auto !important;
+      transform: none !important;
+      filter: none !important;
+      perspective: none !important;
+      contain: none !important;
       user-select: text !important;
       -webkit-user-select: text !important;
       background-color: var(--background-primary, #1e1e1e);
@@ -1068,8 +1072,108 @@ ${customVarsCss}
       border-radius: var(--radius-m, 6px);
     }
 
+    .vault-web-container img {
+      cursor: zoom-in !important;
+    }
+
+    .vault-web-container a img {
+      cursor: pointer !important;
+    }
+
     .vault-web-container a.internal-link {
       cursor: pointer;
+    }
+
+    /* Viewport-locked Image Zoom Lightbox */
+    #vls-image-lightbox {
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      bottom: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      background: rgba(0, 0, 0, 0.86) !important;
+      z-index: 2147483647 !important;
+      display: none;
+      align-items: center !important;
+      justify-content: center !important;
+      cursor: zoom-out !important;
+      box-sizing: border-box !important;
+      opacity: 0;
+      transition: opacity 0.16s ease;
+    }
+
+    #vls-image-lightbox.is-open {
+      display: flex !important;
+      opacity: 1;
+    }
+
+    #vls-image-lightbox-caption {
+      position: fixed !important;
+      top: 14px !important;
+      left: 50% !important;
+      transform: translateX(-50%) !important;
+      color: rgba(255, 255, 255, 0.85) !important;
+      font-size: 13px !important;
+      font-family: var(--font-interface, sans-serif) !important;
+      background: rgba(0, 0, 0, 0.55) !important;
+      padding: 4px 12px !important;
+      border-radius: 6px !important;
+      max-width: 80vw !important;
+      white-space: nowrap !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      pointer-events: none !important;
+      z-index: 2147483647 !important;
+    }
+
+    #vls-image-lightbox-close {
+      position: fixed !important;
+      top: 12px !important;
+      right: 18px !important;
+      width: 36px !important;
+      height: 36px !important;
+      border: none !important;
+      border-radius: 50% !important;
+      background: rgba(255, 255, 255, 0.14) !important;
+      color: #ffffff !important;
+      font-size: 22px !important;
+      line-height: 1 !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      cursor: pointer !important;
+      z-index: 2147483647 !important;
+      transition: background 0.15s ease;
+    }
+
+    #vls-image-lightbox-close:hover {
+      background: rgba(255, 255, 255, 0.28) !important;
+    }
+
+    #vls-image-lightbox-img {
+      position: relative !important;
+      width: auto !important;
+      height: auto !important;
+      min-width: 0 !important;
+      min-height: 0 !important;
+      max-width: 92vw !important;
+      max-height: 90vh !important;
+      object-fit: contain !important;
+      border-radius: 6px !important;
+      box-shadow: 0 12px 48px rgba(0, 0, 0, 0.75) !important;
+      cursor: zoom-out !important;
+      transform: scale(0.95);
+      transition: transform 0.16s ease;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+
+    #vls-image-lightbox.is-open #vls-image-lightbox-img {
+      transform: scale(1);
     }
   </style>
 </head>
@@ -1102,34 +1206,130 @@ ${customVarsCss}
       </div>
     </div>
   </div>
+  <div id="vls-image-lightbox" role="dialog" aria-modal="true" aria-label="Zoomed image">
+    <div id="vls-image-lightbox-caption"></div>
+    <button id="vls-image-lightbox-close" type="button" aria-label="Close zoomed image">&times;</button>
+    <img id="vls-image-lightbox-img" src="" alt="" />
+  </div>
   <script>
-    // Interactive callout folding
-    document.addEventListener('click', (e) => {
-      const calloutTitle = e.target.closest('.callout.is-collapsible .callout-title');
-      if (calloutTitle) {
-        const callout = calloutTitle.closest('.callout');
-        const isNowCollapsed = !callout.classList.contains('is-collapsed');
-        callout.classList.toggle('is-collapsed', isNowCollapsed);
-        const content = callout.querySelector('.callout-content');
-        if (content) {
-          if (isNowCollapsed) {
-            content.style.setProperty('display', 'none', 'important');
-          } else {
-            content.style.removeProperty('display');
-          }
-        }
+    (function () {
+      const lightbox = document.getElementById('vls-image-lightbox');
+      const lightboxImg = document.getElementById('vls-image-lightbox-img');
+      const lightboxCaption = document.getElementById('vls-image-lightbox-caption');
+
+      // Ensure lightbox is a direct child of document.body so no ancestor can trap fixed positioning
+      if (lightbox && lightbox.parentElement !== document.body) {
+        document.body.appendChild(lightbox);
       }
 
-      // Interactive copy-code button
-      const copyBtn = e.target.closest('button.copy-code-button');
-      if (copyBtn) {
-        const pre = copyBtn.closest('pre');
-        const code = pre ? pre.querySelector('code') : null;
-        if (code && navigator.clipboard) {
-          navigator.clipboard.writeText(code.innerText || code.textContent || '');
+      function openLightbox(imgEl) {
+        if (!lightbox || !lightboxImg || !imgEl) return;
+        const src = imgEl.currentSrc || imgEl.getAttribute('src');
+        if (!src) return;
+
+        lightboxImg.src = src;
+        const alt = imgEl.getAttribute('alt') || '';
+        lightboxImg.alt = alt;
+
+        if (lightboxCaption) {
+          lightboxCaption.textContent = alt;
+          lightboxCaption.style.display = alt ? 'block' : 'none';
         }
+
+        // Pin explicitly to the current visible viewport coordinates in case any theme CSS overrides fixed positioning
+        lightbox.style.setProperty('position', 'fixed', 'important');
+        lightbox.style.setProperty('top', '0px', 'important');
+        lightbox.style.setProperty('left', '0px', 'important');
+        lightbox.style.setProperty('width', window.innerWidth + 'px', 'important');
+        lightbox.style.setProperty('height', window.innerHeight + 'px', 'important');
+
+        lightbox.classList.add('is-open');
+        document.documentElement.style.overflow = 'hidden';
+        document.body.style.overflow = 'hidden';
       }
-    });
+
+      function closeLightbox() {
+        if (!lightbox || !lightbox.classList.contains('is-open')) return;
+        lightbox.classList.remove('is-open');
+        document.documentElement.style.removeProperty('overflow');
+        document.body.style.removeProperty('overflow');
+        setTimeout(() => {
+          if (!lightbox.classList.contains('is-open') && lightboxImg) {
+            lightboxImg.src = '';
+          }
+        }, 160);
+      }
+
+      window.addEventListener('resize', () => {
+        if (lightbox && lightbox.classList.contains('is-open')) {
+          lightbox.style.setProperty('width', window.innerWidth + 'px', 'important');
+          lightbox.style.setProperty('height', window.innerHeight + 'px', 'important');
+        }
+      });
+
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          closeLightbox();
+        }
+      });
+
+      // Capture-phase click handler for lightbox, callouts, and copy buttons
+      document.addEventListener('click', (e) => {
+        // 1. Dismiss lightbox on any click while open
+        if (lightbox && lightbox.classList.contains('is-open')) {
+          e.preventDefault();
+          e.stopPropagation();
+          closeLightbox();
+          return;
+        }
+
+        // 2. Open lightbox when clicking an image inside the note (unless wrapped in a link)
+        const clickedImg = e.target.closest('.vault-web-container img');
+        if (clickedImg && !clickedImg.closest('a')) {
+          e.preventDefault();
+          e.stopPropagation();
+          openLightbox(clickedImg);
+          return;
+        }
+
+        const clickedEmbed = e.target.closest('.vault-web-container .image-embed');
+        if (clickedEmbed && !clickedEmbed.closest('a')) {
+          const embedImg = clickedEmbed.querySelector('img');
+          if (embedImg) {
+            e.preventDefault();
+            e.stopPropagation();
+            openLightbox(embedImg);
+            return;
+          }
+        }
+
+        // 3. Interactive callout folding
+        const calloutTitle = e.target.closest('.callout.is-collapsible .callout-title');
+        if (calloutTitle) {
+          const callout = calloutTitle.closest('.callout');
+          const isNowCollapsed = !callout.classList.contains('is-collapsed');
+          callout.classList.toggle('is-collapsed', isNowCollapsed);
+          const content = callout.querySelector('.callout-content');
+          if (content) {
+            if (isNowCollapsed) {
+              content.style.setProperty('display', 'none', 'important');
+            } else {
+              content.style.removeProperty('display');
+            }
+          }
+        }
+
+        // 4. Interactive copy-code button
+        const copyBtn = e.target.closest('button.copy-code-button');
+        if (copyBtn) {
+          const pre = copyBtn.closest('pre');
+          const code = pre ? pre.querySelector('code') : null;
+          if (code && navigator.clipboard) {
+            navigator.clipboard.writeText(code.innerText || code.textContent || '');
+          }
+        }
+      }, true);
+    })();
   </script>
 </body>
 </html>`;
