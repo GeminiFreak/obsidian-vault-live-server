@@ -47,6 +47,7 @@ class VaultLiveServerPlugin extends Plugin {
     this.server = null;
     this.isRunning = false;
     this.cachedAppCss = null;
+    this.lastDynamicWallpaper = null;
 
     this.ribbonEl = this.addRibbonIcon('wifi', 'Toggle Vault Live Server', () => {
       this.toggleServer();
@@ -473,7 +474,7 @@ class VaultLiveServerPlugin extends Plugin {
       a.removeAttribute('rel');
     }
 
-    // 2. Preserve |330 image widths, heights, and |center / |shadow alt modifiers on image embeds
+    // 2. Preserve |330 image widths, heights, and alt modifiers on image embeds
     const imageEmbeds = container.querySelectorAll('.internal-embed.image-embed, span.image-embed');
     for (const embed of imageEmbeds) {
       const embedWidth = embed.getAttribute('width');
@@ -622,15 +623,123 @@ class VaultLiveServerPlugin extends Plugin {
     });
   }
 
+  findDynamicWallpapersConfig() {
+    const basePath = this.getVaultBasePath();
+    const pluginsDir = path.join(basePath, '.obsidian', 'plugins');
+    const candidateIds = [
+      'dynamic-wallpapers-plugin',
+      'obsidian-dynamic-wallpapers',
+      'dynamic-wallpapers'
+    ];
+
+    try {
+      if (fs.existsSync(pluginsDir)) {
+        const entries = fs.readdirSync(pluginsDir);
+        for (const entry of entries) {
+          if (entry.toLowerCase().includes('wallpaper') && !candidateIds.includes(entry)) {
+            candidateIds.push(entry);
+          }
+        }
+      }
+    } catch (_) {}
+
+    for (const id of candidateIds) {
+      const dataPath = path.join(pluginsDir, id, 'data.json');
+      if (fs.existsSync(dataPath)) {
+        try {
+          const raw = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
+          if (raw && typeof raw === 'object') {
+            return raw.settings && typeof raw.settings === 'object' ? raw.settings : raw;
+          }
+        } catch (_) {}
+      }
+    }
+    return null;
+  }
+
+  resolveWallpaperImagePath(rawVal, sourcePath, normalizedBase, dwSettings) {
+    if (!rawVal || typeof rawVal !== 'string') return null;
+
+    let cleaned = rawVal.trim();
+    const urlFnMatch = cleaned.match(/^url\(\s*(['"]?)(.+?)\1\s*\)$/i);
+    if (urlFnMatch) {
+      cleaned = urlFnMatch[2].trim();
+    }
+
+    cleaned = cleaned.replace(/^["']|["']$/g, '').trim();
+    if (cleaned.startsWith('[[') && cleaned.endsWith(']]')) {
+      cleaned = cleaned.slice(2, -2);
+    }
+    cleaned = cleaned.split('|')[0].split('#')[0].trim();
+    if (!cleaned) return null;
+
+    if (cleaned.startsWith('http://') || cleaned.startsWith('https://') || cleaned.startsWith('data:') || cleaned.startsWith('/_vault/')) {
+      return cleaned;
+    }
+
+    if (cleaned.startsWith('app://')) {
+      return this.rewriteAssetUrl(cleaned, normalizedBase, sourcePath);
+    }
+
+    // 1. Resolve anywhere in vault via Obsidian metadataCache
+    const dest = this.app.metadataCache.getFirstLinkpathDest(cleaned, sourcePath);
+    if (dest instanceof TFile) {
+      return '/_vault/' + dest.path.split('/').map(encodeURIComponent).join('/');
+    }
+
+    // 2. Direct vault path lookup
+    const normalizedRel = cleaned.replace(/^\/+/, '');
+    const exactFile = this.app.vault.getAbstractFileByPath(normalizedRel);
+    if (exactFile instanceof TFile) {
+      return '/_vault/' + exactFile.path.split('/').map(encodeURIComponent).join('/');
+    }
+
+    // 3. Check configured wallpaper directory if present
+    const folder = dwSettings.wallpapersDirectory || dwSettings.defaultWallpaperFolder || dwSettings.wallpaperFolder || '';
+    if (folder) {
+      const folderCandidate = `${String(folder).replace(/\/+$/, '')}/${normalizedRel}`;
+      const folderDest = this.app.metadataCache.getFirstLinkpathDest(folderCandidate, sourcePath)
+        || this.app.vault.getAbstractFileByPath(folderCandidate);
+      if (folderDest instanceof TFile) {
+        return '/_vault/' + folderDest.path.split('/').map(encodeURIComponent).join('/');
+      }
+    }
+
+    // 4. Case-insensitive basename fallback across vault files
+    const lowerTarget = normalizedRel.toLowerCase();
+    const matchedFile = this.app.vault.getFiles().find(
+      (f) => f.path.toLowerCase() === lowerTarget || f.name.toLowerCase() === lowerTarget
+    );
+    if (matchedFile) {
+      return '/_vault/' + matchedFile.path.split('/').map(encodeURIComponent).join('/');
+    }
+
+    return null;
+  }
+
   resolveDynamicWallpaperForNote(file, normalizedBase) {
     try {
-      const basePath = this.getVaultBasePath();
-      const dwDataPath = path.join(basePath, '.obsidian', 'plugins', 'dynamic-wallpapers-plugin', 'data.json');
-      if (!fs.existsSync(dwDataPath)) return null;
+      const s = this.findDynamicWallpapersConfig() || {};
 
-      const dwConfig = JSON.parse(fs.readFileSync(dwDataPath, 'utf8'));
-      if (!dwConfig || !dwConfig.settings) return null;
-      const s = dwConfig.settings;
+      const singleKeys = Array.from(new Set([
+        s.wallpaperProperty,
+        'wallpaper',
+        'background',
+        'background-image'
+      ].filter(Boolean)));
+
+      const poolKeys = Array.from(new Set([
+        s.wallpapersProperty,
+        'wallpapers',
+        'backgrounds'
+      ].filter(Boolean)));
+
+      const inheritProp = s.inheritanceProperty || 'inherit_wallpaper';
+      const allowExplicitInherit = s.enableWallpaperInheritance !== false;
+      const allowFmLinkInherit = Boolean(s.inheritFromFrontmatterLinks || s.enableFrontmatterLinkInheritance);
+      const allowBodyLinkInherit = Boolean(s.inheritFromBodyLinks || s.enableBodyLinkInheritance);
+      const allowBacklinkInherit = Boolean(s.inheritFromBacklinks || s.enableBacklinkInheritance);
+      const keepExisting = s.keepExistingWallpaper !== undefined ? Boolean(s.keepExistingWallpaper) : true;
 
       const visited = new Set();
       const findWallpaperInNote = (targetFile, depth) => {
@@ -643,34 +752,37 @@ class VaultLiveServerPlugin extends Plugin {
         const fm = cache && cache.frontmatter ? cache.frontmatter : null;
 
         if (fm) {
-          const wpProp = s.wallpaperProperty || 'wallpaper';
-          if (fm[wpProp]) {
-            const val = Array.isArray(fm[wpProp]) ? fm[wpProp][0] : fm[wpProp];
-            if (typeof val === 'string' && val.trim()) return val.trim();
-          }
-
-          const wpsProp = s.wallpapersProperty || 'wallpapers';
-          if (fm[wpsProp]) {
-            const list = Array.isArray(fm[wpsProp]) ? fm[wpsProp] : [fm[wpsProp]];
-            const valid = list.filter((item) => typeof item === 'string' && item.trim());
-            if (valid.length > 0) {
-              const pick = valid[Math.floor(Math.random() * valid.length)];
-              return pick.trim();
+          for (const key of singleKeys) {
+            if (fm[key]) {
+              const val = Array.isArray(fm[key]) ? fm[key][0] : fm[key];
+              if (typeof val === 'string' && val.trim()) {
+                const resolved = this.resolveWallpaperImagePath(val, targetFile.path, normalizedBase, s);
+                if (resolved) return resolved;
+              }
             }
           }
 
-          if (s.enableWallpaperInheritance) {
-            const inheritProp = s.inheritanceProperty || 'inherit_wallpaper';
-            if (fm[inheritProp]) {
-              const rawTarget = Array.isArray(fm[inheritProp]) ? fm[inheritProp][0] : fm[inheritProp];
-              const cleanLink = String(rawTarget).replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].split('#')[0].trim();
-              const linked = this.app.metadataCache.getFirstLinkpathDest(cleanLink, targetFile.path);
-              const inherited = findWallpaperInNote(linked, depth + 1);
-              if (inherited) return inherited;
+          for (const key of poolKeys) {
+            if (fm[key]) {
+              const list = Array.isArray(fm[key]) ? fm[key] : [fm[key]];
+              const valid = list.filter((item) => typeof item === 'string' && item.trim());
+              if (valid.length > 0) {
+                const pick = valid[Math.floor(Math.random() * valid.length)];
+                const resolved = this.resolveWallpaperImagePath(pick, targetFile.path, normalizedBase, s);
+                if (resolved) return resolved;
+              }
             }
           }
 
-          if (s.enableFrontmatterLinkInheritance && cache.frontmatterLinks) {
+          if (allowExplicitInherit && fm[inheritProp]) {
+            const rawTarget = Array.isArray(fm[inheritProp]) ? fm[inheritProp][0] : fm[inheritProp];
+            const cleanLink = String(rawTarget).replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].split('#')[0].trim();
+            const linked = this.app.metadataCache.getFirstLinkpathDest(cleanLink, targetFile.path);
+            const inherited = findWallpaperInNote(linked, depth + 1);
+            if (inherited) return inherited;
+          }
+
+          if (allowFmLinkInherit && cache.frontmatterLinks) {
             for (const link of cache.frontmatterLinks) {
               const linked = this.app.metadataCache.getFirstLinkpathDest(link.link, targetFile.path);
               const inherited = findWallpaperInNote(linked, depth + 1);
@@ -679,7 +791,7 @@ class VaultLiveServerPlugin extends Plugin {
           }
         }
 
-        if (s.enableBodyLinkInheritance && cache && cache.links) {
+        if (allowBodyLinkInherit && cache && cache.links) {
           for (const link of cache.links) {
             const linked = this.app.metadataCache.getFirstLinkpathDest(link.link, targetFile.path);
             const inherited = findWallpaperInNote(linked, depth + 1);
@@ -687,11 +799,11 @@ class VaultLiveServerPlugin extends Plugin {
           }
         }
 
-        if (s.enableBacklinkInheritance) {
+        if (allowBacklinkInherit) {
           const resolvedLinks = this.app.metadataCache.resolvedLinks || {};
-          for (const [sourcePath, targets] of Object.entries(resolvedLinks)) {
+          for (const [srcPath, targets] of Object.entries(resolvedLinks)) {
             if (targets && Object.prototype.hasOwnProperty.call(targets, targetFile.path)) {
-              const backlinkFile = this.app.vault.getAbstractFileByPath(sourcePath);
+              const backlinkFile = this.app.vault.getAbstractFileByPath(srcPath);
               const inherited = findWallpaperInNote(backlinkFile, depth + 1);
               if (inherited) return inherited;
             }
@@ -701,42 +813,29 @@ class VaultLiveServerPlugin extends Plugin {
         return null;
       };
 
-      const rawWallpaper = findWallpaperInNote(file, 0);
-      if (!rawWallpaper) return null;
-
-      let resolvedUrl = null;
-      const trimmed = rawWallpaper.replace(/^\[\[/, '').replace(/\]\]$/, '').split('|')[0].trim();
-
-      if (trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('data:')) {
-        resolvedUrl = trimmed;
-      } else if (trimmed.startsWith('app://')) {
-        resolvedUrl = this.rewriteAssetUrl(trimmed, normalizedBase, file.path);
-      } else {
-        const dest = this.app.metadataCache.getFirstLinkpathDest(trimmed, file.path);
-        if (dest instanceof TFile) {
-          resolvedUrl = '/_vault/' + dest.path.split('/').map(encodeURIComponent).join('/');
-        } else if (s.defaultWallpaperFolder) {
-          const folderCandidate = `${s.defaultWallpaperFolder.replace(/\/+$/, '')}/${trimmed.replace(/^\/+/, '')}`;
-          const folderDest = this.app.metadataCache.getFirstLinkpathDest(folderCandidate, file.path);
-          if (folderDest instanceof TFile) {
-            resolvedUrl = '/_vault/' + folderDest.path.split('/').map(encodeURIComponent).join('/');
-          }
-        }
-      }
-
-      if (!resolvedUrl) return null;
-
       const isDark = document.body.classList.contains('theme-dark');
       const opacity = isDark
         ? (typeof s.darkModeOpacity === 'number' ? s.darkModeOpacity : 0.75)
         : (typeof s.lightModeOpacity === 'number' ? s.lightModeOpacity : 0.85);
       const blur = typeof s.blur === 'number' ? s.blur : 0;
 
-      return {
-        url: resolvedUrl,
-        opacity,
-        blur
-      };
+      const resolvedUrl = findWallpaperInNote(file, 0);
+      if (resolvedUrl) {
+        const result = { url: resolvedUrl, opacity, blur };
+        this.lastDynamicWallpaper = result;
+        return result;
+      }
+
+      // Keep the last visible wallpaper if current note has none and persistence is enabled
+      if (keepExisting && this.lastDynamicWallpaper) {
+        return {
+          url: this.lastDynamicWallpaper.url,
+          opacity,
+          blur
+        };
+      }
+
+      return null;
     } catch (err) {
       console.warn('[Vault Live Server] Dynamic Wallpaper resolution error:', err);
       return null;
@@ -884,21 +983,15 @@ class VaultLiveServerPlugin extends Plugin {
 
     const title = this.escapeHtml(file.basename);
 
+    // Keep the outer #vault-dynamic-wallpaper wrapper completely free of transform/filter so position: fixed stays locked to the viewport.
+    // Apply blur/scale only on the inner #vault-dynamic-wallpaper-img element.
     const wallpaperLayerHtml = noteWallpaper
-      ? `<div id="vault-dynamic-wallpaper" style="position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 0; pointer-events: none; background-image: url('${this.escapeHtml(noteWallpaper.url)}'); background-size: cover; background-position: center center; background-repeat: no-repeat; ${noteWallpaper.blur > 0 ? `filter: blur(${noteWallpaper.blur}px); transform: scale(1.03);` : ''}"></div>
-         <div id="vault-dynamic-wallpaper-overlay" style="position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 0; pointer-events: none; background-color: var(--background-primary, #1e1e1e); opacity: ${noteWallpaper.opacity};"></div>`
+      ? `<div id="vault-dynamic-wallpaper" aria-hidden="true"><div id="vault-dynamic-wallpaper-img" style="background-image: url('${this.escapeHtml(noteWallpaper.url)}'); ${noteWallpaper.blur > 0 ? `filter: blur(${noteWallpaper.blur}px); transform: scale(1.04);` : ''}"></div></div>
+         <div id="vault-dynamic-wallpaper-overlay" aria-hidden="true" style="opacity: ${noteWallpaper.opacity};"></div>`
       : '';
 
-    const wallpaperOverrideCss = noteWallpaper
+    const wallpaperContainerTransparencyCss = noteWallpaper
       ? `
-    /* Override Obsidian's active-tab global wallpaper pseudo-elements so per-note wallpaper renders at locked 100vh */
-    body::before,
-    body::after,
-    .app-container::before,
-    .app-container::after {
-      background-image: none !important;
-      content: none !important;
-    }
     html, body, .app-container, .horizontal-main-container, .workspace, .workspace-split, .workspace-leaf, .workspace-leaf-content, .view-content, .markdown-reading-view, .markdown-preview-view {
       background-color: transparent !important;
     }
@@ -927,6 +1020,7 @@ ${diskSnippetsCss}
 ${customVarsCss}
   </style>
   <style id="vault-live-server-layout">
+    /* Prevent Obsidian app.css / themes from creating a transform/filter/contain containing block on html or body */
     html, body {
       margin: 0 !important;
       padding: 0 !important;
@@ -939,6 +1033,8 @@ ${customVarsCss}
       filter: none !important;
       perspective: none !important;
       contain: none !important;
+      backdrop-filter: none !important;
+      will-change: auto !important;
       user-select: text !important;
       -webkit-user-select: text !important;
       background-color: var(--background-primary, #1e1e1e);
@@ -946,7 +1042,64 @@ ${customVarsCss}
       font-family: var(--font-text, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
     }
 
-    ${wallpaperOverrideCss}
+    /* Always suppress Obsidian's live desktop-tab wallpaper bleed-through */
+    body::before,
+    body::after,
+    .app-container::before,
+    .app-container::after {
+      background-image: none !important;
+      content: none !important;
+    }
+
+    ${wallpaperContainerTransparencyCss}
+
+    /* Viewport-locked wallpaper frame (no transform/filter on the fixed box itself) */
+    #vault-dynamic-wallpaper {
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      bottom: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      z-index: 0 !important;
+      pointer-events: none !important;
+      overflow: hidden !important;
+      transform: none !important;
+      filter: none !important;
+      contain: none !important;
+    }
+
+    #vault-dynamic-wallpaper-img {
+      position: absolute !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      background-size: cover !important;
+      background-position: center center !important;
+      background-repeat: no-repeat !important;
+      pointer-events: none !important;
+    }
+
+    #vault-dynamic-wallpaper-overlay {
+      position: fixed !important;
+      top: 0 !important;
+      left: 0 !important;
+      right: 0 !important;
+      bottom: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      z-index: 0 !important;
+      pointer-events: none !important;
+      background-color: var(--background-primary, #1e1e1e) !important;
+      transform: none !important;
+      filter: none !important;
+      contain: none !important;
+    }
 
     /* Hide Obsidian desktop UI chrome */
     .workspace-ribbon,
@@ -959,7 +1112,7 @@ ${customVarsCss}
       display: none !important;
     }
 
-    /* Unlock Obsidian workspace containers so the page scrolls naturally in Thorium */
+    /* Unlock Obsidian workspace containers so the page scrolls naturally in browser */
     .app-container,
     .horizontal-main-container,
     .workspace,
@@ -978,6 +1131,8 @@ ${customVarsCss}
       min-height: 100vh !important;
       overflow: visible !important;
       contain: none !important;
+      transform: none !important;
+      filter: none !important;
     }
 
     .vault-web-container {
@@ -1072,11 +1227,11 @@ ${customVarsCss}
       border-radius: var(--radius-m, 6px);
     }
 
-    .vault-web-container img {
+    .vault-web-container .markdown-preview-sizer img {
       cursor: zoom-in !important;
     }
 
-    .vault-web-container a img {
+    .vault-web-container .markdown-preview-sizer a img {
       cursor: pointer !important;
     }
 
@@ -1084,8 +1239,8 @@ ${customVarsCss}
       cursor: pointer;
     }
 
-    /* Viewport-locked Image Zoom Lightbox */
-    #vls-image-lightbox {
+    /* Full-window image zoom lightbox pinned strictly to the active browser viewport */
+    #vault-image-lightbox {
       position: fixed !important;
       top: 0 !important;
       left: 0 !important;
@@ -1095,85 +1250,83 @@ ${customVarsCss}
       height: 100vh !important;
       margin: 0 !important;
       padding: 0 !important;
-      background: rgba(0, 0, 0, 0.86) !important;
-      z-index: 2147483647 !important;
+      z-index: 999999 !important;
+      background-color: rgba(0, 0, 0, 0.88) !important;
       display: none;
       align-items: center !important;
       justify-content: center !important;
-      cursor: zoom-out !important;
       box-sizing: border-box !important;
+      cursor: zoom-out !important;
       opacity: 0;
       transition: opacity 0.16s ease;
     }
 
-    #vls-image-lightbox.is-open {
+    #vault-image-lightbox.is-open {
       display: flex !important;
-      opacity: 1;
+      opacity: 1 !important;
     }
 
-    #vls-image-lightbox-caption {
+    #vault-image-lightbox-caption {
       position: fixed !important;
       top: 14px !important;
       left: 50% !important;
       transform: translateX(-50%) !important;
+      max-width: 80vw !important;
       color: rgba(255, 255, 255, 0.85) !important;
       font-size: 13px !important;
       font-family: var(--font-interface, sans-serif) !important;
-      background: rgba(0, 0, 0, 0.55) !important;
-      padding: 4px 12px !important;
-      border-radius: 6px !important;
-      max-width: 80vw !important;
       white-space: nowrap !important;
       overflow: hidden !important;
       text-overflow: ellipsis !important;
       pointer-events: none !important;
-      z-index: 2147483647 !important;
+      z-index: 999999 !important;
     }
 
-    #vls-image-lightbox-close {
+    #vault-image-lightbox-close {
       position: fixed !important;
       top: 12px !important;
       right: 18px !important;
-      width: 36px !important;
-      height: 36px !important;
+      width: 34px !important;
+      height: 34px !important;
       border: none !important;
-      border-radius: 50% !important;
-      background: rgba(255, 255, 255, 0.14) !important;
+      border-radius: 6px !important;
+      background: rgba(255, 255, 255, 0.12) !important;
       color: #ffffff !important;
       font-size: 22px !important;
       line-height: 1 !important;
-      display: flex !important;
+      display: inline-flex !important;
       align-items: center !important;
       justify-content: center !important;
       cursor: pointer !important;
-      z-index: 2147483647 !important;
-      transition: background 0.15s ease;
+      z-index: 999999 !important;
     }
 
-    #vls-image-lightbox-close:hover {
-      background: rgba(255, 255, 255, 0.28) !important;
+    #vault-image-lightbox-close:hover {
+      background: rgba(255, 255, 255, 0.24) !important;
     }
 
-    #vls-image-lightbox-img {
+    #vault-image-lightbox-img {
       position: relative !important;
+      display: block !important;
       width: auto !important;
       height: auto !important;
       min-width: 0 !important;
       min-height: 0 !important;
       max-width: 92vw !important;
-      max-height: 90vh !important;
+      max-height: 92vh !important;
+      margin: auto !important;
       object-fit: contain !important;
-      border-radius: 6px !important;
-      box-shadow: 0 12px 48px rgba(0, 0, 0, 0.75) !important;
+      border-radius: var(--radius-m, 6px) !important;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.75) !important;
       cursor: zoom-out !important;
       transform: scale(0.95);
       transition: transform 0.16s ease;
-      margin: 0 !important;
-      padding: 0 !important;
+      user-select: none !important;
+      -webkit-user-select: none !important;
     }
 
-    #vls-image-lightbox.is-open #vls-image-lightbox-img {
-      transform: scale(1);
+    #vault-image-lightbox.is-open #vault-image-lightbox-img {
+      transform: scale(1) !important;
     }
   </style>
 </head>
@@ -1206,50 +1359,81 @@ ${customVarsCss}
       </div>
     </div>
   </div>
-  <div id="vls-image-lightbox" role="dialog" aria-modal="true" aria-label="Zoomed image">
-    <div id="vls-image-lightbox-caption"></div>
-    <button id="vls-image-lightbox-close" type="button" aria-label="Close zoomed image">&times;</button>
-    <img id="vls-image-lightbox-img" src="" alt="" />
+  <div id="vault-image-lightbox" role="dialog" aria-modal="true" aria-label="Zoomed image">
+    <div id="vault-image-lightbox-caption"></div>
+    <button id="vault-image-lightbox-close" type="button" aria-label="Close zoomed image">&times;</button>
+    <img id="vault-image-lightbox-img" src="" alt="" />
   </div>
   <script>
     (function () {
-      const lightbox = document.getElementById('vls-image-lightbox');
-      const lightboxImg = document.getElementById('vls-image-lightbox-img');
-      const lightboxCaption = document.getElementById('vls-image-lightbox-caption');
+      const wpLayer = document.getElementById('vault-dynamic-wallpaper');
+      const wpOverlay = document.getElementById('vault-dynamic-wallpaper-overlay');
+      const lightbox = document.getElementById('vault-image-lightbox');
+      const lightboxImg = document.getElementById('vault-image-lightbox-img');
+      const lightboxCaption = document.getElementById('vault-image-lightbox-caption');
 
-      // Ensure lightbox is a direct child of document.body so no ancestor can trap fixed positioning
-      if (lightbox && lightbox.parentElement !== document.body) {
-        document.body.appendChild(lightbox);
+      // Reparent fixed overlays directly under <html> (document.documentElement) so body styles cannot trap fixed positioning
+      if (wpLayer && wpLayer.parentNode !== document.documentElement) {
+        document.documentElement.appendChild(wpLayer);
+      }
+      if (wpOverlay && wpOverlay.parentNode !== document.documentElement) {
+        document.documentElement.appendChild(wpOverlay);
+      }
+      if (lightbox && lightbox.parentNode !== document.documentElement) {
+        document.documentElement.appendChild(lightbox);
       }
 
-      function openLightbox(imgEl) {
+      // Belt-and-suspenders viewport lock: if any external CSS rule ever forces html into a containing block,
+      // detect top !== 0 on scroll and keep the wallpaper layers pinned strictly to the visible viewport.
+      if (wpLayer || wpOverlay) {
+        let ticking = false;
+        const syncWallpaperViewport = () => {
+          ticking = false;
+          const scrollY = window.scrollY || window.pageYOffset || 0;
+          if (wpLayer) {
+            const rect = wpLayer.getBoundingClientRect();
+            if (Math.abs(rect.top) > 0.5) {
+              wpLayer.style.setProperty('top', scrollY + 'px', 'important');
+            }
+          }
+          if (wpOverlay) {
+            const rect = wpOverlay.getBoundingClientRect();
+            if (Math.abs(rect.top) > 0.5) {
+              wpOverlay.style.setProperty('top', scrollY + 'px', 'important');
+            }
+          }
+        };
+        window.addEventListener('scroll', () => {
+          if (!ticking) {
+            ticking = true;
+            requestAnimationFrame(syncWallpaperViewport);
+          }
+        }, { passive: true });
+        window.addEventListener('resize', syncWallpaperViewport, { passive: true });
+      }
+
+      function openImageLightbox(imgEl) {
         if (!lightbox || !lightboxImg || !imgEl) return;
         const src = imgEl.currentSrc || imgEl.getAttribute('src');
         if (!src) return;
 
+        lightboxImg.removeAttribute('width');
+        lightboxImg.removeAttribute('height');
         lightboxImg.src = src;
-        const alt = imgEl.getAttribute('alt') || '';
-        lightboxImg.alt = alt;
+        lightboxImg.alt = imgEl.getAttribute('alt') || '';
 
-        if (lightboxCaption) {
-          lightboxCaption.textContent = alt;
-          lightboxCaption.style.display = alt ? 'block' : 'none';
-        }
+        const wrapper = imgEl.closest('.image-embed');
+        const label = (wrapper && wrapper.getAttribute('alt')) || imgEl.getAttribute('alt') || '';
+        lightboxCaption.textContent = label;
 
-        // Pin explicitly to the current visible viewport coordinates in case any theme CSS overrides fixed positioning
-        lightbox.style.setProperty('position', 'fixed', 'important');
-        lightbox.style.setProperty('top', '0px', 'important');
-        lightbox.style.setProperty('left', '0px', 'important');
-        lightbox.style.setProperty('width', window.innerWidth + 'px', 'important');
-        lightbox.style.setProperty('height', window.innerHeight + 'px', 'important');
+        document.documentElement.style.setProperty('overflow', 'hidden', 'important');
+        document.body.style.setProperty('overflow', 'hidden', 'important');
 
         lightbox.classList.add('is-open');
-        document.documentElement.style.overflow = 'hidden';
-        document.body.style.overflow = 'hidden';
       }
 
-      function closeLightbox() {
-        if (!lightbox || !lightbox.classList.contains('is-open')) return;
+      function closeImageLightbox() {
+        if (!lightbox) return;
         lightbox.classList.remove('is-open');
         document.documentElement.style.removeProperty('overflow');
         document.body.style.removeProperty('overflow');
@@ -1257,53 +1441,30 @@ ${customVarsCss}
           if (!lightbox.classList.contains('is-open') && lightboxImg) {
             lightboxImg.src = '';
           }
-        }, 160);
+        }, 170);
       }
 
-      window.addEventListener('resize', () => {
-        if (lightbox && lightbox.classList.contains('is-open')) {
-          lightbox.style.setProperty('width', window.innerWidth + 'px', 'important');
-          lightbox.style.setProperty('height', window.innerHeight + 'px', 'important');
-        }
-      });
-
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-          closeLightbox();
-        }
-      });
-
-      // Capture-phase click handler for lightbox, callouts, and copy buttons
+      // Capture-phase listener so Obsidian/theme embed wrappers cannot swallow image clicks
       document.addEventListener('click', (e) => {
-        // 1. Dismiss lightbox on any click while open
         if (lightbox && lightbox.classList.contains('is-open')) {
           e.preventDefault();
           e.stopPropagation();
-          closeLightbox();
+          closeImageLightbox();
           return;
         }
 
-        // 2. Open lightbox when clicking an image inside the note (unless wrapped in a link)
         const clickedImg = e.target.closest('.vault-web-container img');
-        if (clickedImg && !clickedImg.closest('a')) {
+        const clickedEmbed = !clickedImg ? e.target.closest('.vault-web-container .image-embed') : null;
+        const targetImg = clickedImg || (clickedEmbed ? clickedEmbed.querySelector('img') : null);
+
+        if (targetImg && !targetImg.closest('a')) {
           e.preventDefault();
           e.stopPropagation();
-          openLightbox(clickedImg);
+          openImageLightbox(targetImg);
           return;
         }
 
-        const clickedEmbed = e.target.closest('.vault-web-container .image-embed');
-        if (clickedEmbed && !clickedEmbed.closest('a')) {
-          const embedImg = clickedEmbed.querySelector('img');
-          if (embedImg) {
-            e.preventDefault();
-            e.stopPropagation();
-            openLightbox(embedImg);
-            return;
-          }
-        }
-
-        // 3. Interactive callout folding
+        // Interactive callout folding
         const calloutTitle = e.target.closest('.callout.is-collapsible .callout-title');
         if (calloutTitle) {
           const callout = calloutTitle.closest('.callout');
@@ -1319,7 +1480,7 @@ ${customVarsCss}
           }
         }
 
-        // 4. Interactive copy-code button
+        // Interactive copy-code button
         const copyBtn = e.target.closest('button.copy-code-button');
         if (copyBtn) {
           const pre = copyBtn.closest('pre');
@@ -1327,6 +1488,13 @@ ${customVarsCss}
           if (code && navigator.clipboard) {
             navigator.clipboard.writeText(code.innerText || code.textContent || '');
           }
+        }
+      }, true);
+
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && lightbox && lightbox.classList.contains('is-open')) {
+          e.preventDefault();
+          closeImageLightbox();
         }
       }, true);
     })();
