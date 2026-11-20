@@ -12,6 +12,8 @@ A lightweight, dependency-free Obsidian desktop plugin that serves your live Obs
 - **HTTP Range Video Streaming:** Streams `.mp4`, `.webm`, `.mkv`, and audio files directly from disk with seeking support.
 - **Built-in Security:** Binds strictly to `127.0.0.1` (localhost only) by default and protects all routes with configurable HTTP Basic Authentication.
 - **One-Click Controls:** Toggle the server on or off anytime from Obsidian's left ribbon, bottom-right status bar, or Command Palette.
+- **Image Magnification on Click:** Click any embedded image in your served notes to view it magnified in a full-screen overlay without interfering with Dynamic Wallpapers.
+
 
 ## Installation
 
